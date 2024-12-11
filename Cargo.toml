@@ -3,7 +3,15 @@ name = "hot-resize"
 version = "0.1.0"
 edition = "2021"
 description = "Safe disk resizing tool for NixOS"
-license = "MIT"
+license = "GPL-3.0"
+repository = "https://github.com/liberodark/hot-resize"
+readme = "README.md"
+keywords = ["resize", "disk", "nixos", "partition", "filesystem"]
+categories = ["command-line-utilities", "filesystem"]
+
+[features]
+default = ["block-utils-support"]
+block-utils-support = ["block-utils"]
 
 [dependencies]
 clap = { version = "4.4", features = ["derive"] }
@@ -13,5 +21,12 @@ thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 nix = "0.27"
-block-utils = "0.11"
+block-utils = { version = "0.11", optional = true }
 which = "4.4"
+
+[profile.release]
+strip = true
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

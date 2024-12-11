@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::process::Command;
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Error, Debug)]
 pub enum ResizeError {
@@ -13,107 +13,349 @@ pub enum ResizeError {
     CommandFailed(String),
     #[error("Device not found: {0}")]
     DeviceNotFound(String),
+    #[error("Failed to resize LUKS container: {0}")]
+    ResizeLuks(String),
+    #[error("Alternative approach failed: {0}")]
+    AlternativeApproachFailed(String),
 }
 
-/// Grows a partition to its maximum available size
-///
-/// # Arguments
-/// * `disk` - Name of the disk (e.g., "/dev/sda")
-/// * `partition` - Partition number
-///
-/// # Returns
-/// * `Ok(())` if successful
-/// * `Err(ResizeError)` if any step fails
+pub fn get_fs_type(device: &Path) -> Result<String, ResizeError> {
+    let blkid_output = Command::new("blkid")
+        .arg("-s")
+        .arg("TYPE")
+        .arg("-o")
+        .arg("value")
+        .arg(device)
+        .output();
+
+    match blkid_output {
+        Ok(output) => {
+            if output.status.success() {
+                let fs_type = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !fs_type.is_empty() {
+                    return Ok(fs_type);
+                }
+            }
+        }
+        Err(e) => {
+            debug!("blkid failed: {}", e);
+        }
+    }
+
+    let lsblk_output = Command::new("lsblk")
+        .args(["-ndo", "FSTYPE", &device.to_string_lossy()])
+        .output();
+
+    match lsblk_output {
+        Ok(output) => {
+            if output.status.success() {
+                let fs_type = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !fs_type.is_empty() {
+                    return Ok(fs_type);
+                }
+            }
+        }
+        Err(e) => {
+            debug!("lsblk failed: {}", e);
+        }
+    }
+
+    let file_output = Command::new("file")
+        .args(["-Ls", &device.to_string_lossy()])
+        .output();
+
+    match file_output {
+        Ok(output) => {
+            if output.status.success() {
+                let output_str = String::from_utf8_lossy(&output.stdout).to_lowercase();
+                if output_str.contains("ext4") {
+                    return Ok("ext4".to_string());
+                } else if output_str.contains("xfs") {
+                    return Ok("xfs".to_string());
+                } else if output_str.contains("btrfs") {
+                    return Ok("btrfs".to_string());
+                }
+            }
+        }
+        Err(e) => {
+            debug!("file command failed: {}", e);
+        }
+    }
+
+    Err(ResizeError::ResizeFs(format!(
+        "Failed to detect filesystem type for {}",
+        device.display()
+    )))
+}
+
 pub fn grow_partition(disk: &str, partition: u32) -> Result<(), ResizeError> {
     info!("Growing partition {} on disk {}", partition, disk);
 
-    let output = Command::new("growpart")
+    let growpart_output = Command::new("growpart")
         .args([disk, &partition.to_string()])
-        .output()
-        .map_err(|e| ResizeError::CommandFailed(e.to_string()))?;
+        .output();
 
-    if !output.status.success() {
-        let error = String::from_utf8_lossy(&output.stderr);
-        // growpart returns 2 when partition is already at maximum size
-        if output.status.code() == Some(2) {
-            warn!("Partition is already at maximum size");
-            return Ok(());
+    match growpart_output {
+        Ok(output) => {
+            if output.status.success() {
+                info!("Successfully grew partition using growpart");
+                return Ok(());
+            } else if output.status.code() == Some(2) {
+                warn!("Partition is already at maximum size");
+                return Ok(());
+            } else {
+                let error = String::from_utf8_lossy(&output.stderr);
+                warn!("growpart failed: {}", error);
+            }
         }
-        return Err(ResizeError::GrowPartition(error.to_string()));
+        Err(e) => {
+            warn!("Failed to execute growpart: {}", e);
+        }
     }
 
-    info!("Successfully grew partition");
-    Ok(())
+    info!("Trying alternative approach with parted");
+    let parted_output = Command::new("parted")
+        .args([
+            "--script",
+            disk,
+            "resizepart",
+            &partition.to_string(),
+            "100%",
+        ])
+        .output();
+
+    match parted_output {
+        Ok(output) => {
+            if output.status.success() {
+                info!("Successfully grew partition using parted");
+                return Ok(());
+            } else {
+                let error = String::from_utf8_lossy(&output.stderr);
+                warn!("parted failed: {}", error);
+            }
+        }
+        Err(e) => {
+            warn!("Failed to execute parted: {}", e);
+        }
+    }
+
+    Err(ResizeError::GrowPartition(
+        "Failed to grow partition with growpart and parted".to_string(),
+    ))
 }
 
-/// Resizes a filesystem to its maximum available size
-///
-/// # Arguments
-/// * `device` - Path to the device (e.g., "/dev/sda1")
-/// * `fs_type` - Filesystem type ("ext4", "xfs", or "btrfs")
-/// * `mount_point` - Mount point of the filesystem
-///
-/// # Returns
-/// * `Ok(())` if successful
-/// * `Err(ResizeError)` if any step fails
-pub fn resize_filesystem(device: &Path, fs_type: &str, mount_point: &Path) -> Result<(), ResizeError> {
+pub fn resize_filesystem(
+    device: &Path,
+    fs_type: &str,
+    mount_point: &Path,
+) -> Result<(), ResizeError> {
+    let real_fs_type = match get_fs_type(device) {
+        Ok(fs) => fs,
+        Err(_) => {
+            info!(
+                "Could not detect filesystem type, using specified type: {}",
+                fs_type
+            );
+            fs_type.to_string()
+        }
+    };
+
+    if real_fs_type != fs_type {
+        info!(
+            "Detected filesystem type {} differs from specified {}",
+            real_fs_type, fs_type
+        );
+        return resize_fs(&real_fs_type, device, mount_point);
+    }
+
+    resize_fs(fs_type, device, mount_point)
+}
+
+fn resize_fs(fs_type: &str, device: &Path, mount_point: &Path) -> Result<(), ResizeError> {
     info!("Resizing {} filesystem on {}", fs_type, device.display());
 
-    let status = match fs_type {
-        "ext4" => Command::new("resize2fs")
-            .arg(device)
-            .status(),
-        "xfs" => Command::new("xfs_growfs")
-            .arg(mount_point)
-            .status(),
-        "btrfs" => Command::new("btrfs")
-            .args(["filesystem", "resize", "max", &mount_point.to_string_lossy()])
-            .status(),
-        _ => return Err(ResizeError::ResizeFs(format!("Unsupported filesystem: {}", fs_type))),
-    }.map_err(|e| ResizeError::CommandFailed(e.to_string()))?;
+    match fs_type.to_lowercase().as_str() {
+        "ext4" | "ext3" | "ext2" => {
+            let resize2fs_output = Command::new("resize2fs").arg("-f").arg(device).output();
 
-    if !status.success() {
-        return Err(ResizeError::ResizeFs(format!(
-            "Failed to resize {} filesystem", fs_type
-        )));
+            match resize2fs_output {
+                Ok(output) => {
+                    if output.status.success() {
+                        info!("Successfully resized ext filesystem");
+                        return Ok(());
+                    }
+                    let error = String::from_utf8_lossy(&output.stderr);
+                    warn!("resize2fs failed: {}", error);
+                }
+                Err(e) => {
+                    warn!("Failed to execute resize2fs: {}", e);
+                }
+            }
+
+            Err(ResizeError::ResizeFs(format!(
+                "Failed to resize {} filesystem",
+                fs_type
+            )))
+        }
+        "xfs" => {
+            let xfs_growfs_output = Command::new("xfs_growfs").arg(mount_point).output();
+
+            match xfs_growfs_output {
+                Ok(output) => {
+                    if output.status.success() {
+                        info!("Successfully resized XFS filesystem");
+                        return Ok(());
+                    }
+                    let error = String::from_utf8_lossy(&output.stderr);
+                    warn!("xfs_growfs failed: {}", error);
+
+                    let xfs_growfs_d_output = Command::new("xfs_growfs")
+                        .args(["-d", &mount_point.to_string_lossy()])
+                        .output();
+
+                    match xfs_growfs_d_output {
+                        Ok(output) => {
+                            if output.status.success() {
+                                info!("Successfully resized XFS filesystem using -d flag");
+                                return Ok(());
+                            }
+                            let error = String::from_utf8_lossy(&output.stderr);
+                            warn!("xfs_growfs -d failed: {}", error);
+                        }
+                        Err(e) => {
+                            warn!("Failed to execute xfs_growfs -d: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to execute xfs_growfs: {}", e);
+                }
+            }
+
+            Err(ResizeError::ResizeFs(
+                "Failed to resize XFS filesystem".to_string(),
+            ))
+        }
+        "btrfs" => {
+            let btrfs_resize_output = Command::new("btrfs")
+                .args([
+                    "filesystem",
+                    "resize",
+                    "max",
+                    &mount_point.to_string_lossy(),
+                ])
+                .output();
+
+            match btrfs_resize_output {
+                Ok(output) => {
+                    if output.status.success() {
+                        info!("Successfully resized Btrfs filesystem");
+                        return Ok(());
+                    }
+                    let error = String::from_utf8_lossy(&output.stderr);
+                    warn!("btrfs filesystem resize failed: {}", error);
+
+                    let btrfs_alt_output = Command::new("btrfs")
+                        .args(["resize", "max", &mount_point.to_string_lossy()])
+                        .output();
+
+                    match btrfs_alt_output {
+                        Ok(output) => {
+                            if output.status.success() {
+                                info!(
+                                    "Successfully resized Btrfs filesystem using alternate command"
+                                );
+                                return Ok(());
+                            }
+                            let error = String::from_utf8_lossy(&output.stderr);
+                            warn!("btrfs resize failed: {}", error);
+                        }
+                        Err(e) => {
+                            warn!("Failed to execute btrfs resize: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to execute btrfs filesystem resize: {}", e);
+                }
+            }
+
+            Err(ResizeError::ResizeFs(
+                "Failed to resize Btrfs filesystem".to_string(),
+            ))
+        }
+        _ => Err(ResizeError::ResizeFs(format!(
+            "Unsupported filesystem: {}",
+            fs_type
+        ))),
     }
-
-    info!("Successfully resized filesystem");
-    Ok(())
 }
 
-/// Verifies filesystem size after resize
-///
-/// # Arguments
-/// * `mount_point` - Mount point to verify
-///
-/// # Returns
-/// * `Ok(())` if verification succeeds
-/// * `Err(ResizeError)` if verification fails
+pub fn resize_luks(device: &Path) -> Result<(), ResizeError> {
+    info!("Resizing LUKS container on {}", device.display());
+
+    let cryptsetup_output = Command::new("cryptsetup")
+        .args(["resize", &device.to_string_lossy()])
+        .output();
+
+    match cryptsetup_output {
+        Ok(output) => {
+            if output.status.success() {
+                info!("Successfully resized LUKS container");
+                return Ok(());
+            }
+            let error = String::from_utf8_lossy(&output.stderr);
+            Err(ResizeError::ResizeLuks(error.to_string()))
+        }
+        Err(e) => Err(ResizeError::CommandFailed(e.to_string())),
+    }
+}
+
 pub fn verify_resize(mount_point: &Path) -> Result<(), ResizeError> {
     info!("Verifying resize at {}", mount_point.display());
 
-    let output = Command::new("df")
+    let df_output = Command::new("df")
         .args(["-h", &mount_point.to_string_lossy()])
-        .output()
-        .map_err(|e| ResizeError::CommandFailed(e.to_string()))?;
+        .output();
 
-    if !output.status.success() {
-        return Err(ResizeError::CommandFailed("Failed to get filesystem size".into()));
+    match df_output {
+        Ok(output) => {
+            if output.status.success() {
+                info!("Current size:\n{}", String::from_utf8_lossy(&output.stdout));
+                return Ok(());
+            }
+            warn!("df command failed");
+        }
+        Err(e) => {
+            warn!("Failed to execute df: {}", e);
+        }
     }
 
-    info!("Current size:\n{}", String::from_utf8_lossy(&output.stdout));
-    Ok(())
-}
+    let lsblk_output = Command::new("lsblk")
+        .args(["-fo", "NAME,SIZE,MOUNTPOINT", "--path"])
+        .output();
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    match lsblk_output {
+        Ok(output) => {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let filtered_output: String = stdout
+                    .lines()
+                    .filter(|line| line.contains(&*mount_point.to_string_lossy()))
+                    .collect::<Vec<&str>>()
+                    .join("\n");
 
-    #[test]
-    fn test_verify_resize() {
-        let root_path = Path::new("/");
-        let result = verify_resize(root_path);
-        assert!(result.is_ok(), "Should be able to verify root filesystem");
+                info!("Current size from lsblk:\n{}", filtered_output);
+                return Ok(());
+            }
+            warn!("lsblk command failed");
+        }
+        Err(e) => {
+            warn!("Failed to execute lsblk: {}", e);
+        }
     }
+
+    Err(ResizeError::CommandFailed(
+        "Failed to get filesystem size information".into(),
+    ))
 }

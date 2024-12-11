@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use thiserror::Error;
+use tracing::info;
 use which::which;
 
 pub mod resize;
@@ -27,11 +28,38 @@ pub enum DeviceError {
 }
 
 /// Checks if all required tools are available in the system
-pub fn check_requirements() -> Result<(), DeviceError> {
-    let required_tools = ["lsblk", "growpart", "resize2fs", "xfs_growfs", "btrfs"];
+pub fn check_requirements(fs_types: &[&str]) -> Result<(), DeviceError> {
+    let mut required_tools = vec!["lsblk", "growpart"];
 
-    for tool in required_tools {
-        which(tool).map_err(|_| DeviceError::MissingTool(tool.to_string()))?;
+    // Add filesystem-specific tools based on the provided types
+    for fs_type in fs_types {
+        match *fs_type {
+            "ext4" | "ext3" | "ext2" => {
+                if !required_tools.contains(&"resize2fs") {
+                    required_tools.push("resize2fs");
+                }
+            }
+            "xfs" => {
+                if !required_tools.contains(&"xfs_growfs") {
+                    required_tools.push("xfs_growfs");
+                }
+            }
+            "btrfs" => {
+                if !required_tools.contains(&"btrfs") {
+                    required_tools.push("btrfs");
+                }
+            }
+            _ => {
+                return Err(DeviceError::MissingTool(format!(
+                    "Unsupported filesystem: {}",
+                    fs_type
+                )))
+            }
+        }
+    }
+
+    for tool in &required_tools {
+        which(*tool).map_err(|_| DeviceError::MissingTool((*tool).to_string()))?;
     }
 
     Ok(())
@@ -46,31 +74,59 @@ pub fn check_requirements() -> Result<(), DeviceError> {
 /// * `BlockDevice` containing device information
 /// * `DeviceError` if analysis fails
 pub fn analyze_device(device_path: &Path) -> Result<BlockDevice, DeviceError> {
-    // Resolve the real device path
     let real_device = std::fs::canonicalize(device_path)
         .map_err(|_| DeviceError::NotFound(device_path.to_path_buf()))?;
 
-    // Get device information using lsblk
+    info!("Running lsblk on device: {:?}", real_device);
     let output = Command::new("lsblk")
-        .args(["-ndo", "pkname,part", real_device.to_str().unwrap()])
+        .args([
+            "-Pno",              // key=value format, no headers
+            "pkname,name,partn", // parent kernel name, name, partition number
+            real_device.to_str().unwrap(),
+        ])
         .output()
-        .map_err(|e| DeviceError::DeviceInfo(e.to_string()))?;
+        .map_err(|e| DeviceError::DeviceInfo(format!("Failed to execute lsblk: {}", e)))?;
 
     if !output.status.success() {
-        return Err(DeviceError::DeviceInfo("lsblk failed".to_string()));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(DeviceError::DeviceInfo(format!(
+            "lsblk failed with error: {}",
+            stderr
+        )));
     }
 
     let info = String::from_utf8_lossy(&output.stdout);
-    let parts: Vec<&str> = info.split_whitespace().collect();
-
-    if parts.len() != 2 {
-        return Err(DeviceError::NotPartition);
+    if info.trim().is_empty() {
+        return Err(DeviceError::DeviceInfo(format!(
+            "lsblk returned no output for device {:?}",
+            real_device
+        )));
     }
 
-    let disk_name = parts[0].to_string();
-    let partition_number = parts[1]
-        .parse::<u32>()
-        .map_err(|_| DeviceError::DeviceInfo("Invalid partition number".to_string()))?;
+    info!("lsblk output: '{}'", info.trim());
+
+    // Parse the key=value format
+    let mut disk_name = None;
+    let mut partition_number = None;
+
+    for pair in info.trim().split(' ') {
+        let mut kv = pair.split('=');
+        match (kv.next(), kv.next()) {
+            (Some("PKNAME"), Some(name)) => disk_name = Some(name.trim_matches('"').to_string()),
+            (Some("PARTN"), Some(num)) => {
+                partition_number = Some(num.trim_matches('"').parse::<u32>().map_err(|_| {
+                    DeviceError::DeviceInfo("Invalid partition number".to_string())
+                })?);
+            }
+            _ => {}
+        }
+    }
+
+    let disk_name = disk_name
+        .ok_or_else(|| DeviceError::DeviceInfo("Could not determine parent device".to_string()))?;
+    let partition_number = partition_number.ok_or_else(|| {
+        DeviceError::DeviceInfo("Could not determine partition number".to_string())
+    })?;
 
     Ok(BlockDevice {
         real_device,
@@ -84,21 +140,19 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    /// Test required tools verification
     #[test]
     fn test_check_requirements() {
-        // Capture specific errors for each missing tool
-        match check_requirements() {
+        let fs_types = vec!["ext4", "xfs", "btrfs"];
+        match check_requirements(&fs_types) {
             Ok(_) => println!("All tools are available"),
             Err(DeviceError::MissingTool(tool)) => {
-                // This is expected in build environment
                 assert!(
                     ["lsblk", "growpart", "resize2fs", "xfs_growfs", "btrfs"]
                         .contains(&tool.as_str()),
                     "Unexpected missing tool: {}",
                     tool
                 );
-            },
+            }
             Err(e) => panic!("Unexpected error type: {}", e),
         }
     }
@@ -111,15 +165,25 @@ mod tests {
 
     #[test]
     fn test_device_info_parsing() {
-        // Test with simulated lsblk output
-        let disk_name = "sda";
-        let part_num = 1;
-        let device_info = format!("{} {}", disk_name, part_num);
+        let mock_output = "PKNAME=\"sda\" NAME=\"sda1\" PARTN=\"1\"";
+        let mut disk_name = None;
+        let mut partition_number = None;
 
-        let parts: Vec<&str> = device_info.split_whitespace().collect();
-        assert_eq!(parts.len(), 2, "Device info should have two parts");
-        assert_eq!(parts[0], disk_name);
-        assert_eq!(parts[1].parse::<u32>().unwrap(), part_num);
+        for pair in mock_output.split(' ') {
+            let mut kv = pair.split('=');
+            match (kv.next(), kv.next()) {
+                (Some("PKNAME"), Some(name)) => {
+                    disk_name = Some(name.trim_matches('"').to_string())
+                }
+                (Some("PARTN"), Some(num)) => {
+                    partition_number = Some(num.trim_matches('"').parse::<u32>().unwrap());
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(disk_name.unwrap(), "sda");
+        assert_eq!(partition_number.unwrap(), 1);
     }
 
     #[test]
