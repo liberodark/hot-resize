@@ -29,12 +29,7 @@ The following tools must be installed on your system:
 #### NixOS
 ```nix
 environment.systemPackages = with pkgs; [
-  util-linux
-  cloud-utils
-  e2fsprogs
-  xfsprogs
-  btrfs-progs
-  cryptsetup
+  hot-resize
 ];
 ```
 
@@ -120,7 +115,7 @@ imports = [
 
 services.hot-resize = {
   enable = true;
-  runAtBoot = true;
+  skipVerify = false;
   devices = [
     {
       device = "/dev/vda1";

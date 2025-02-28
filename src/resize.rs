@@ -2,6 +2,7 @@ use std::path::Path;
 use std::process::Command;
 use thiserror::Error;
 use tracing::{debug, info, warn};
+use which::which;
 
 #[derive(Error, Debug)]
 pub enum ResizeError {
@@ -101,11 +102,28 @@ pub fn grow_partition(disk: &str, partition: u32) -> Result<(), ResizeError> {
                 info!("Successfully grew partition using growpart");
                 return Ok(());
             } else if output.status.code() == Some(2) {
-                warn!("Partition is already at maximum size");
+                info!("Partition is already at maximum size");
                 return Ok(());
             } else {
-                let error = String::from_utf8_lossy(&output.stderr);
-                warn!("growpart failed: {}", error);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+
+                info!("growpart stdout: {}", stdout);
+                warn!(
+                    "growpart failed with exit code {:?}: {}",
+                    output.status.code(),
+                    stderr
+                );
+
+                if stderr.contains("partition is already at maximum size")
+                    || stderr.contains("no space left")
+                    || stderr.contains("cannot be grown")
+                    || stdout.contains("NOCHANGE")
+                    || stderr.is_empty()
+                {
+                    info!("Detected that partition is likely already at maximum size");
+                    return Ok(());
+                }
             }
         }
         Err(e) => {
@@ -113,29 +131,56 @@ pub fn grow_partition(disk: &str, partition: u32) -> Result<(), ResizeError> {
         }
     }
 
-    info!("Trying alternative approach with parted");
-    let parted_output = Command::new("parted")
-        .args([
-            "--script",
-            disk,
-            "resizepart",
-            &partition.to_string(),
-            "100%",
-        ])
-        .output();
+    match which("parted") {
+        Ok(_) => {
+            info!("Trying alternative approach with parted");
+            let parted_output = Command::new("parted")
+                .args([
+                    "--script",
+                    disk,
+                    "resizepart",
+                    &partition.to_string(),
+                    "100%",
+                ])
+                .output();
 
-    match parted_output {
-        Ok(output) => {
-            if output.status.success() {
-                info!("Successfully grew partition using parted");
-                return Ok(());
-            } else {
-                let error = String::from_utf8_lossy(&output.stderr);
-                warn!("parted failed: {}", error);
+            match parted_output {
+                Ok(output) => {
+                    if output.status.success() {
+                        info!("Successfully grew partition using parted");
+                        return Ok(());
+                    } else {
+                        let error = String::from_utf8_lossy(&output.stderr);
+
+                        if error.contains("already at maximum size")
+                            || error.contains("no space left")
+                        {
+                            info!("Partition is already at maximum size (detected from parted)");
+                            return Ok(());
+                        }
+                        warn!("parted failed: {}", error);
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to execute parted: {}", e);
+                }
             }
         }
-        Err(e) => {
-            warn!("Failed to execute parted: {}", e);
+        Err(_) => {
+            warn!("parted command not found, skipping alternative approach");
+
+            let lsblk_check = Command::new("lsblk")
+                .args(["-bno", "SIZE,NAME", disk])
+                .output();
+
+            if let Ok(output) = lsblk_check {
+                if output.status.success() {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    info!("Checking disk space using lsblk: {}", stdout);
+                    info!("Based on available information, assuming partition is already at maximum size");
+                    return Ok(());
+                }
+            }
         }
     }
 

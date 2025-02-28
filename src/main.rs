@@ -210,21 +210,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Process each device
+    let mut success_count = 0;
+    let total_devices = devices.len();
+
     for (i, device) in devices.iter().enumerate() {
         info!(
             "Processing device {}/{}: {:?}",
             i + 1,
-            devices.len(),
+            total_devices,
             device.device
         );
-        if let Err(e) = process_device(device, args.dry_run, args.skip_verify) {
-            error!("Failed to process device {:?}: {}", device.device, e);
-            // Continue with other devices
-            continue;
+        match process_device(device, args.dry_run, args.skip_verify) {
+            Ok(_) => {
+                info!("Successfully processed device {:?}", device.device);
+                success_count += 1;
+            }
+            Err(e) => {
+                error!("Failed to process device {:?}: {}", device.device, e);
+                // Continue with other devices
+            }
         }
-        info!("Successfully processed device {:?}", device.device);
     }
 
-    info!("Operation completed successfully");
+    if success_count == total_devices {
+        info!("Operation completed successfully for all devices");
+    } else {
+        info!(
+            "Operation completed with {}/{} devices processed successfully",
+            success_count, total_devices
+        );
+    }
+
     Ok(())
 }
