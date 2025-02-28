@@ -120,7 +120,7 @@ imports = [
 
 services.hot-resize = {
   enable = true;
-  runAtBoot = true;
+  skipVerify = false;
   devices = [
     {
       device = "/dev/vda1";
