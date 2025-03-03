@@ -89,11 +89,17 @@ pub fn get_fs_type(device: &Path) -> Result<String, ResizeError> {
     )))
 }
 
-pub fn grow_partition(disk: &str, partition: u32) -> Result<(), ResizeError> {
-    info!("Growing partition {} on disk {}", partition, disk);
+pub fn grow_partition(disk: &str, partition: Option<u32>) -> Result<(), ResizeError> {
+    if partition.is_none() {
+        info!("Device is a whole disk (not a partition), skipping partition resize");
+        return Ok(());
+    }
+
+    let partition_num = partition.unwrap();
+    info!("Growing partition {} on disk {}", partition_num, disk);
 
     let growpart_output = Command::new("growpart")
-        .args([disk, &partition.to_string()])
+        .args([disk, &partition_num.to_string()])
         .output();
 
     match growpart_output {
@@ -139,7 +145,7 @@ pub fn grow_partition(disk: &str, partition: u32) -> Result<(), ResizeError> {
                     "--script",
                     disk,
                     "resizepart",
-                    &partition.to_string(),
+                    &partition_num.to_string(),
                     "100%",
                 ])
                 .output();

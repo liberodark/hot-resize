@@ -92,13 +92,26 @@ fn process_device(
     info!("Device information:");
     info!("  Real device: {:?}", block_device.real_device);
     info!("  Disk: {}", block_device.disk_name);
-    info!("  Partition: {}", block_device.partition_number);
+
+    if let Some(partition_num) = block_device.partition_number {
+        info!("  Partition: {}", partition_num);
+    } else {
+        info!("  Whole disk (no partition)");
+    }
 
     if dry_run {
-        info!(
-            "[DRY RUN] Would resize partition {} on disk /dev/{}",
-            block_device.partition_number, block_device.disk_name
-        );
+        if let Some(partition_num) = block_device.partition_number {
+            info!(
+                "[DRY RUN] Would resize partition {} on disk /dev/{}",
+                partition_num, block_device.disk_name
+            );
+        } else {
+            info!(
+                "[DRY RUN] Would skip partition resize for whole disk /dev/{}",
+                block_device.disk_name
+            );
+        }
+
         info!(
             "[DRY RUN] Would resize {} filesystem at {:?}",
             device.fs_type.as_str(),
@@ -118,10 +131,14 @@ fn process_device(
     }
 
     // Grow partition
-    resize::grow_partition(
-        &format!("/dev/{}", block_device.disk_name),
-        block_device.partition_number,
-    )?;
+    if block_device.partition_number.is_some() {
+        resize::grow_partition(
+            &format!("/dev/{}", block_device.disk_name),
+            block_device.partition_number,
+        )?;
+    } else {
+        info!("Skipping partition resize for whole disk device");
+    }
 
     if is_luks {
         info!("Resizing LUKS container");

@@ -10,7 +10,7 @@ pub mod resize;
 pub struct BlockDevice {
     pub real_device: PathBuf,
     pub disk_name: String,
-    pub partition_number: u32,
+    pub partition_number: Option<u32>,
 }
 
 #[derive(Error, Debug)]
@@ -21,8 +21,6 @@ pub enum DeviceError {
     MissingTool(String),
     #[error("Failed to get device info: {0}")]
     DeviceInfo(String),
-    #[error("Not a partition device")]
-    NotPartition,
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -108,25 +106,39 @@ pub fn analyze_device(device_path: &Path) -> Result<BlockDevice, DeviceError> {
     // Parse the key=value format
     let mut disk_name = None;
     let mut partition_number = None;
+    let mut name = None;
 
     for pair in info.trim().split(' ') {
         let mut kv = pair.split('=');
         match (kv.next(), kv.next()) {
-            (Some("PKNAME"), Some(name)) => disk_name = Some(name.trim_matches('"').to_string()),
+            (Some("PKNAME"), Some(pkname)) => {
+                let pkname_str = pkname.trim_matches('"');
+                if !pkname_str.is_empty() {
+                    disk_name = Some(pkname_str.to_string());
+                }
+            }
+            (Some("NAME"), Some(n)) => {
+                name = Some(n.trim_matches('"').to_string());
+            }
             (Some("PARTN"), Some(num)) => {
-                partition_number = Some(num.trim_matches('"').parse::<u32>().map_err(|_| {
-                    DeviceError::DeviceInfo("Invalid partition number".to_string())
-                })?);
+                let num_str = num.trim_matches('"');
+                if !num_str.is_empty() {
+                    partition_number = Some(num_str.parse::<u32>().map_err(|_| {
+                        DeviceError::DeviceInfo("Invalid partition number".to_string())
+                    })?);
+                }
             }
             _ => {}
         }
     }
 
-    let disk_name = disk_name
-        .ok_or_else(|| DeviceError::DeviceInfo("Could not determine parent device".to_string()))?;
-    let partition_number = partition_number.ok_or_else(|| {
-        DeviceError::DeviceInfo("Could not determine partition number".to_string())
-    })?;
+    let disk_name = disk_name.unwrap_or_else(|| name.clone().unwrap_or_default());
+
+    if disk_name.is_empty() {
+        return Err(DeviceError::DeviceInfo(
+            "Could not determine device name".to_string(),
+        ));
+    }
 
     Ok(BlockDevice {
         real_device,
@@ -168,22 +180,59 @@ mod tests {
         let mock_output = "PKNAME=\"sda\" NAME=\"sda1\" PARTN=\"1\"";
         let mut disk_name = None;
         let mut partition_number = None;
+        let mut name = None;
 
         for pair in mock_output.split(' ') {
             let mut kv = pair.split('=');
             match (kv.next(), kv.next()) {
-                (Some("PKNAME"), Some(name)) => {
-                    disk_name = Some(name.trim_matches('"').to_string())
+                (Some("PKNAME"), Some(pkname)) => {
+                    disk_name = Some(pkname.trim_matches('"').to_string());
+                }
+                (Some("NAME"), Some(n)) => {
+                    name = Some(n.trim_matches('"').to_string());
                 }
                 (Some("PARTN"), Some(num)) => {
-                    partition_number = Some(num.trim_matches('"').parse::<u32>().unwrap());
+                    let num_str = num.trim_matches('"');
+                    partition_number = Some(num_str.parse::<u32>().unwrap());
                 }
                 _ => {}
             }
         }
 
         assert_eq!(disk_name.unwrap(), "sda");
+        assert_eq!(name.unwrap(), "sda1");
         assert_eq!(partition_number.unwrap(), 1);
+
+        let mock_output = "PKNAME=\"\" NAME=\"vdb\" PARTN=\"\"";
+        let mut disk_name = None;
+        let mut partition_number = None;
+        let mut name = None;
+
+        for pair in mock_output.split(' ') {
+            let mut kv = pair.split('=');
+            match (kv.next(), kv.next()) {
+                (Some("PKNAME"), Some(pkname)) => {
+                    let pkname_str = pkname.trim_matches('"');
+                    if !pkname_str.is_empty() {
+                        disk_name = Some(pkname_str.to_string());
+                    }
+                }
+                (Some("NAME"), Some(n)) => {
+                    name = Some(n.trim_matches('"').to_string());
+                }
+                (Some("PARTN"), Some(num)) => {
+                    let num_str = num.trim_matches('"');
+                    if !num_str.is_empty() {
+                        partition_number = Some(num_str.parse::<u32>().unwrap());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(disk_name, None);
+        assert_eq!(name.unwrap(), "vdb");
+        assert_eq!(partition_number, None);
     }
 
     #[test]
@@ -191,11 +240,21 @@ mod tests {
         let device = BlockDevice {
             real_device: PathBuf::from("/dev/sda1"),
             disk_name: "sda".to_string(),
-            partition_number: 1,
+            partition_number: Some(1),
         };
 
         assert_eq!(device.disk_name, "sda");
-        assert_eq!(device.partition_number, 1);
+        assert_eq!(device.partition_number, Some(1));
         assert_eq!(device.real_device, PathBuf::from("/dev/sda1"));
+
+        let device = BlockDevice {
+            real_device: PathBuf::from("/dev/vdb"),
+            disk_name: "vdb".to_string(),
+            partition_number: None,
+        };
+
+        assert_eq!(device.disk_name, "vdb");
+        assert_eq!(device.partition_number, None);
+        assert_eq!(device.real_device, PathBuf::from("/dev/vdb"));
     }
 }
