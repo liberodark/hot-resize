@@ -51,7 +51,7 @@ pub fn check_requirements(fs_types: &[&str]) -> Result<(), DeviceError> {
                 return Err(DeviceError::MissingTool(format!(
                     "Unsupported filesystem: {}",
                     fs_type
-                )))
+                )));
             }
         }
     }

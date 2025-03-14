@@ -183,7 +183,9 @@ pub fn grow_partition(disk: &str, partition: Option<u32>) -> Result<(), ResizeEr
                 if output.status.success() {
                     let stdout = String::from_utf8_lossy(&output.stdout);
                     info!("Checking disk space using lsblk: {}", stdout);
-                    info!("Based on available information, assuming partition is already at maximum size");
+                    info!(
+                        "Based on available information, assuming partition is already at maximum size"
+                    );
                     return Ok(());
                 }
             }

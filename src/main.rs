@@ -187,7 +187,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Check if running as root unless explicitly skipped
     if !args.no_root_check && !is_root() {
-        error!("This program must be run as root. Use sudo or --no-root-check to skip this check (not recommended)");
+        error!(
+            "This program must be run as root. Use sudo or --no-root-check to skip this check (not recommended)"
+        );
         return Err("This program must be run as root".into());
     }
 

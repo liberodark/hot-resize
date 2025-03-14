@@ -4,6 +4,7 @@ pkgs.mkShell {
   buildInputs = with pkgs; [
     rustc
     cargo
+    cargo-audit
     rustfmt
     clippy
     rust-analyzer
@@ -19,9 +20,8 @@ pkgs.mkShell {
   ];
 
   shellHook = ''
-    export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath [
-      pkgs.systemd
-    ]}:$LD_LIBRARY_PATH
+    rustfmt --edition 2024 src/*.rs
+    cargo audit
   '';
 
   RUST_BACKTRACE = 1;
