@@ -184,7 +184,7 @@ dependencies = [
 
 [[package]]
 name = "hot-resize"
-version = "0.1.0"
+version = "0.1.3"
 dependencies = [
  "block-utils",
  "clap",
