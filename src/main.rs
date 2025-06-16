@@ -58,23 +58,10 @@ impl FileSystem {
 fn is_root() -> bool {
     #[cfg(unix)]
     {
-        let output = Command::new("id")
-            .arg("-u")
-            .output()
-            .ok()
-            .and_then(|output| {
-                if output.status.success() {
-                    let uid = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    Some(uid == "0")
-                } else {
-                    None
-                }
-            });
-
-        output.unwrap_or(false)
+        nix::unistd::Uid::effective().is_root()
     }
 
-    #[cfg(windows)]
+    #[cfg(not(unix))]
     {
         false
     }
