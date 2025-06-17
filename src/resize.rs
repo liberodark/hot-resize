@@ -370,16 +370,6 @@ pub fn resize_luks(device: &Path) -> Result<(), ResizeError> {
 pub fn verify_resize(mount_point: &Path) -> Result<(), ResizeError> {
     info!("Verifying resize at {}", mount_point.display());
 
-    match get_filesystem_info_native(mount_point) {
-        Ok(info_string) => {
-            info!("Current size:\n{}", info_string);
-            return Ok(());
-        }
-        Err(e) => {
-            debug!("Native filesystem info failed: {}, trying df", e);
-        }
-    }
-
     let df_output = Command::new("df")
         .args(["-h", &mount_point.to_string_lossy()])
         .output();
@@ -424,76 +414,4 @@ pub fn verify_resize(mount_point: &Path) -> Result<(), ResizeError> {
     Err(ResizeError::CommandFailed(
         "Failed to get filesystem size information".into(),
     ))
-}
-
-fn get_filesystem_info_native(mount_point: &Path) -> Result<String, ResizeError> {
-    use nix::sys::statvfs::statvfs;
-
-    let stat = statvfs(mount_point)
-        .map_err(|e| ResizeError::CommandFailed(format!("statvfs failed: {}", e)))?;
-
-    let block_size = stat.fragment_size();
-    let total_blocks = stat.blocks();
-    let free_blocks = stat.blocks_free();
-    let available_blocks = stat.blocks_available();
-
-    let total_bytes = total_blocks * block_size;
-    let free_bytes = free_blocks * block_size;
-    let used_bytes = total_bytes - free_bytes;
-    let available_bytes = available_blocks * block_size;
-
-    let percent_used = if total_bytes > 0 {
-        ((used_bytes as f64 / total_bytes as f64) * 100.0) as u8
-    } else {
-        0
-    };
-
-    let total_human = format_bytes_human(total_bytes);
-    let used_human = format_bytes_human(used_bytes);
-    let available_human = format_bytes_human(available_bytes);
-
-    let device = get_device_for_mount(mount_point)
-        .unwrap_or_else(|| mount_point.to_string_lossy().to_string());
-
-    Ok(format!(
-        "Filesystem      Size  Used Avail Use% Mounted on\n{:<15} {:>4}  {:>4} {:>5} {:>3}% {}",
-        device,
-        total_human,
-        used_human,
-        available_human,
-        percent_used,
-        mount_point.display()
-    ))
-}
-
-fn format_bytes_human(bytes: u64) -> String {
-    const UNITS: &[&str] = &["B", "K", "M", "G", "T", "P"];
-    const THRESHOLD: f64 = 1024.0;
-
-    let mut size = bytes as f64;
-    let mut unit_index = 0;
-
-    while size >= THRESHOLD && unit_index < UNITS.len() - 1 {
-        size /= THRESHOLD;
-        unit_index += 1;
-    }
-
-    if unit_index == 0 {
-        format!("{:.0}{}", size, UNITS[unit_index])
-    } else if size < 10.0 {
-        format!("{:.1}{}", size, UNITS[unit_index])
-    } else {
-        format!("{:.0}{}", size, UNITS[unit_index])
-    }
-}
-
-fn get_device_for_mount(mount_point: &Path) -> Option<String> {
-    std::fs::read_to_string("/proc/mounts")
-        .ok()?
-        .lines()
-        .find(|line| {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            parts.get(1) == Some(&mount_point.to_string_lossy().as_ref())
-        })
-        .and_then(|line| line.split_whitespace().next().map(|s| s.to_string()))
 }
