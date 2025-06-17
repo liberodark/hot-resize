@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use thiserror::Error;
-use tracing::info;
+use tracing::debug;
 use which::which;
 
 pub mod resize;
@@ -75,7 +75,7 @@ pub fn analyze_device(device_path: &Path) -> Result<BlockDevice, DeviceError> {
     let real_device = std::fs::canonicalize(device_path)
         .map_err(|_| DeviceError::NotFound(device_path.to_path_buf()))?;
 
-    info!("Running lsblk on device: {:?}", real_device);
+    debug!("Running lsblk on device: {:?}", real_device);
     let output = Command::new("lsblk")
         .args([
             "-Pno",              // key=value format, no headers
@@ -101,7 +101,7 @@ pub fn analyze_device(device_path: &Path) -> Result<BlockDevice, DeviceError> {
         )));
     }
 
-    info!("lsblk output: '{}'", info.trim());
+    debug!("lsblk output: '{}'", info.trim());
 
     // Parse the key=value format
     let mut disk_name = None;

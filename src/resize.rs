@@ -115,11 +115,14 @@ pub fn grow_partition(disk: &str, partition: Option<u32>) -> Result<(), ResizeEr
                 let stdout = String::from_utf8_lossy(&output.stdout);
 
                 info!("growpart stdout: {}", stdout);
-                warn!(
-                    "growpart failed with exit code {:?}: {}",
-                    output.status.code(),
-                    stderr
-                );
+
+                if !stderr.trim().is_empty() {
+                    warn!(
+                        "growpart failed with exit code {:?}: {}",
+                        output.status.code(),
+                        stderr.trim_end()
+                    );
+                }
 
                 if stderr.contains("partition is already at maximum size")
                     || stderr.contains("no space left")

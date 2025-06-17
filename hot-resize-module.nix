@@ -68,6 +68,18 @@ in
       default = false;
       description = "Skip filesystem verification after resize";
     };
+
+    daemon = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = "Enable daemon mode for automatic disk resizing";
+    };
+
+    checkInterval = lib.mkOption {
+      type = lib.types.int;
+      default = 60;
+      description = "Check interval in seconds for daemon mode";
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -77,12 +89,13 @@ in
       requires = [ "local-fs-pre.target" ];
       after = [ "local-fs-pre.target" ];
       serviceConfig = {
-        Type = "oneshot";
+        Type = if cfg.daemon then "simple" else "oneshot";
         RemainAfterExit = false;
         ExecStart =
           "${lib.getExe cfg.package}"
           + " --devices '${devicesJson}'"
-          + lib.optionalString cfg.skipVerify " --skip-verify";
+          + lib.optionalString cfg.skipVerify " --skip-verify"
+          + lib.optionalString cfg.daemon " --auto --interval ${toString cfg.checkInterval}";
       };
     };
   };
