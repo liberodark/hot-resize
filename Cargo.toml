@@ -23,7 +23,7 @@ tracing-subscriber = "0.3"
 nix = { version = "0.30", features = ["user"] }
 block-utils = { version = "0.11", optional = true }
 which = "8.0"
-ctrlc = "3.4"
+ctrlc = "3.5"
 
 [profile.release]
 strip = true
