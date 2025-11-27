@@ -182,15 +182,15 @@ pub fn grow_partition(disk: &str, partition: Option<u32>) -> Result<(), ResizeEr
                 .args(["-bno", "SIZE,NAME", disk])
                 .output();
 
-            if let Ok(output) = lsblk_check {
-                if output.status.success() {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    info!("Checking disk space using lsblk: {}", stdout);
-                    info!(
-                        "Based on available information, assuming partition is already at maximum size"
-                    );
-                    return Ok(());
-                }
+            if let Ok(output) = lsblk_check
+                && output.status.success()
+            {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                info!("Checking disk space using lsblk: {}", stdout);
+                info!(
+                    "Based on available information, assuming partition is already at maximum size"
+                );
+                return Ok(());
             }
         }
     }
