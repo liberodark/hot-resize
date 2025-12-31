@@ -110,13 +110,13 @@ jobs:
           tar -czvf hot-resize-${{ env.VERSION }}-linux-x86_64.tar.gz hot-resize
           cd ../..
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: hot-resize-linux
           path: target/release/hot-resize
       - name: Upload tarball artifact
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: hot-resize-linux-tarball
           path: target/release/hot-resize-${{ env.VERSION }}-linux-x86_64.tar.gz
