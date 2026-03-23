@@ -1,5 +1,5 @@
 use clap::Parser;
-use hot_resize::{analyze_device, check_requirements, resize};
+use hot_resize::{analyze_device, check_requirements, get_device_size, resize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -78,19 +78,6 @@ fn is_root() -> bool {
     {
         false
     }
-}
-
-fn get_device_size(device: &Path) -> Result<u64, Box<dyn std::error::Error>> {
-    let output = Command::new("blockdev")
-        .args(["--getsize64", &device.to_string_lossy()])
-        .output()?;
-
-    if !output.status.success() {
-        return Err("Failed to get device size".into());
-    }
-
-    let size_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok(size_str.parse::<u64>()?)
 }
 
 fn process_device(

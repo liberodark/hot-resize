@@ -370,48 +370,92 @@ pub fn resize_luks(device: &Path) -> Result<(), ResizeError> {
 pub fn verify_resize(mount_point: &Path) -> Result<(), ResizeError> {
     info!("Verifying resize at {}", mount_point.display());
 
-    let df_output = Command::new("df")
-        .args(["-h", &mount_point.to_string_lossy()])
-        .output();
+    let stat = nix::sys::statvfs::statvfs(mount_point).map_err(|e| {
+        ResizeError::CommandFailed(format!("statvfs failed on {:?}: {}", mount_point, e))
+    })?;
 
-    match df_output {
-        Ok(output) => {
-            if output.status.success() {
-                info!("Current size:\n{}", String::from_utf8_lossy(&output.stdout));
-                return Ok(());
-            }
-            warn!("df command failed");
-        }
-        Err(e) => {
-            warn!("Failed to execute df: {}", e);
-        }
+    let block_size = stat.fragment_size() as u64;
+    let total = stat.blocks() * block_size;
+    let free = stat.blocks_free() * block_size;
+    let available = stat.blocks_available() * block_size;
+    let used = total.saturating_sub(free);
+
+    info!("Filesystem at {:?}:", mount_point);
+    info!("  Total:     {}", format_bytes(total));
+    info!("  Used:      {}", format_bytes(used));
+    info!("  Available: {}", format_bytes(available));
+
+    Ok(())
+}
+
+/// Formats a byte count into a human-readable string (e.g. "1.5 GiB")
+fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+    const TIB: u64 = 1024 * GIB;
+
+    if bytes >= TIB {
+        format!("{:.1} TiB", bytes as f64 / TIB as f64)
+    } else if bytes >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn test_format_bytes_zero() {
+        assert_eq!(format_bytes(0), "0 B");
     }
 
-    let lsblk_output = Command::new("lsblk")
-        .args(["-fo", "NAME,SIZE,MOUNTPOINT", "--path"])
-        .output();
-
-    match lsblk_output {
-        Ok(output) => {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let filtered_output: String = stdout
-                    .lines()
-                    .filter(|line| line.contains(&*mount_point.to_string_lossy()))
-                    .collect::<Vec<&str>>()
-                    .join("\n");
-
-                info!("Current size from lsblk:\n{}", filtered_output);
-                return Ok(());
-            }
-            warn!("lsblk command failed");
-        }
-        Err(e) => {
-            warn!("Failed to execute lsblk: {}", e);
-        }
+    #[test]
+    fn test_format_bytes_small() {
+        assert_eq!(format_bytes(512), "512 B");
     }
 
-    Err(ResizeError::CommandFailed(
-        "Failed to get filesystem size information".into(),
-    ))
+    #[test]
+    fn test_format_bytes_kib() {
+        assert_eq!(format_bytes(1024), "1.0 KiB");
+        assert_eq!(format_bytes(1536), "1.5 KiB");
+    }
+
+    #[test]
+    fn test_format_bytes_mib() {
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MiB");
+        assert_eq!(format_bytes(500 * 1024 * 1024), "500.0 MiB");
+    }
+
+    #[test]
+    fn test_format_bytes_gib() {
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0 GiB");
+        assert_eq!(format_bytes(20 * 1024 * 1024 * 1024), "20.0 GiB");
+    }
+
+    #[test]
+    fn test_format_bytes_tib() {
+        assert_eq!(format_bytes(1024 * 1024 * 1024 * 1024), "1.0 TiB");
+    }
+
+    #[test]
+    fn test_verify_resize_root() {
+        // Root filesystem should always be available
+        let result = verify_resize(Path::new("/"));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_verify_resize_nonexistent_mount() {
+        let result = verify_resize(Path::new("/nonexistent_mount_point_xyz"));
+        assert!(result.is_err());
+    }
 }
