@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::process::Command;
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 #[derive(Error, Debug)]
 pub enum ResizeError {
@@ -164,11 +164,32 @@ pub fn grow_partition(disk: &str, partition: Option<u32>) -> Result<(), ResizeEr
     // Step 5: Build modified dump with new size
     let new_dump = build_new_dump(&dump, &disk_info, new_size)?;
 
-    // Step 6: Apply the new table via sfdisk with backup
-    apply_sfdisk(disk, &new_dump)?;
+    // Step 6: Lock the disk to protect against udev races (same as growpart).
+    // The lock is held across sfdisk write + partx update, and released
+    // before udevadm settle (same sequence as growpart).
+    let disk_lock = std::fs::File::open(disk)
+        .ok()
+        .and_then(|f| nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusive).ok());
+    if disk_lock.is_none() {
+        warn!("Failed to lock disk {}, continuing without lock", disk);
+    }
 
-    // Step 7: Notify kernel
+    // Step 7: Apply the new table via sfdisk with backup and restore on failure
+    let apply_result = apply_sfdisk(disk, &new_dump, &dump);
+
+    if apply_result.is_err() {
+        // Release flock and settle even on failure (same as growpart cleanup)
+        drop(disk_lock);
+        udevadm_settle();
+        return apply_result;
+    }
+
+    // Step 8: Notify kernel (while still holding the flock)
     notify_kernel_partition_change(disk, partition_num);
+
+    // Step 9: Release flock, then let udev finish processing
+    drop(disk_lock);
+    udevadm_settle();
 
     info!("Successfully grew partition {} on {}", partition_num, disk);
     Ok(())
@@ -474,59 +495,169 @@ fn build_new_dump(dump: &str, info: &SfdiskDiskInfo, new_size: u64) -> Result<St
     Ok(result)
 }
 
-/// Applies a modified sfdisk dump to the disk with backup.
-fn apply_sfdisk(disk: &str, new_dump: &str) -> Result<(), ResizeError> {
-    // Lock the disk to protect against udev races (same as growpart).
-    // The lock is released when _disk_lock is dropped.
-    let disk_lock = std::fs::File::open(disk)
-        .ok()
-        .and_then(|f| nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusive).ok());
-    if disk_lock.is_none() {
-        warn!("Failed to lock disk {}, continuing without lock", disk);
-    }
+/// Applies a modified sfdisk dump to the disk.
+///
+/// Creates a binary backup of the partition table before writing (via `sfdisk -O`).
+/// If sfdisk fails, attempts to restore the original table from the backup.
+/// The original dump is logged on failure for manual recovery.
+fn apply_sfdisk(disk: &str, new_dump: &str, original_dump: &str) -> Result<(), ResizeError> {
+    // Create a temp directory for backup files
+    let backup_dir = std::env::temp_dir().join(format!("hot-resize-{}", std::process::id()));
+    std::fs::create_dir_all(&backup_dir).map_err(|e| {
+        ResizeError::GrowPartition(format!("Failed to create backup directory: {}", e))
+    })?;
+    let backup_path = backup_dir.join("pt-backup");
 
+    // Run sfdisk with -O to save a binary backup before writing
     let mut child = Command::new("sfdisk")
-        .args(["--no-reread", "--force", disk])
+        .args([
+            "--no-reread",
+            "--force",
+            "-O",
+            &backup_path.to_string_lossy(),
+            disk,
+        ])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| ResizeError::GrowPartition(format!("Failed to execute sfdisk: {}", e)))?;
+        .map_err(|e| {
+            let _ = std::fs::remove_dir_all(&backup_dir);
+            ResizeError::GrowPartition(format!("Failed to execute sfdisk: {}", e))
+        })?;
 
     if let Some(mut stdin) = child.stdin.take() {
         use std::io::Write;
         let _ = stdin.write_all(new_dump.as_bytes());
     }
 
-    let output = child
-        .wait_with_output()
-        .map_err(|e| ResizeError::GrowPartition(format!("sfdisk wait failed: {}", e)))?;
+    let output = child.wait_with_output().map_err(|e| {
+        let _ = std::fs::remove_dir_all(&backup_dir);
+        ResizeError::GrowPartition(format!("sfdisk wait failed: {}", e))
+    })?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    if output.status.success() {
-        return Ok(());
-    }
-
-    // sfdisk may exit non-zero but still have written the table successfully,
-    // with the BLKRRPART ioctl failing because the partition is mounted.
-    if (stderr.contains("BLKRRPART") || stderr.contains("Device or resource busy"))
+    let success = if output.status.success() {
+        true
+    } else if (stderr.contains("BLKRRPART") || stderr.contains("Device or resource busy"))
         && (stdout.contains("The partition table has been altered")
             || stdout.contains("new partition table"))
     {
+        // sfdisk wrote the table but kernel re-read failed because partition is mounted.
+        // This is expected — partx --update will handle it.
         info!("sfdisk wrote partition table, kernel re-read deferred to partx");
+        true
+    } else {
+        false
+    };
+
+    if success {
+        let _ = std::fs::remove_dir_all(&backup_dir);
         return Ok(());
     }
 
+    // sfdisk failed — attempt to restore from backup
     warn!(
         "sfdisk failed (exit {:?}): {}",
         output.status.code(),
         stderr.trim_end()
     );
+    warn!("Attempting to restore partition table from backup...");
+
+    match restore_partition_table(disk, &backup_path) {
+        Ok(()) => {
+            warn!("Partition table restored successfully");
+        }
+        Err(e) => {
+            // Restore failed — log the original dump for manual recovery
+            error!("Failed to restore partition table: {}", e);
+            error!(
+                "Original partition table dump for manual recovery:\n{}",
+                original_dump
+            );
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&backup_dir);
+
     Err(ResizeError::GrowPartition(
         "sfdisk failed to write partition table".to_string(),
     ))
+}
+
+/// Restores a partition table from backup files created by `sfdisk -O`.
+///
+/// Modern sfdisk creates files named `<backup_path>-0x<offset>.bak`.
+/// Each file contains the raw sectors at the given offset.
+fn restore_partition_table(disk: &str, backup_path: &std::path::Path) -> Result<(), ResizeError> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let backup_prefix = backup_path.to_string_lossy().to_string();
+
+    // Find all backup files matching <backup_path>*.bak
+    let parent_dir = backup_path
+        .parent()
+        .ok_or_else(|| ResizeError::GrowPartition("Invalid backup path".to_string()))?;
+
+    let mut restored = 0u32;
+    for entry in std::fs::read_dir(parent_dir).map_err(|e| {
+        ResizeError::GrowPartition(format!("Failed to read backup directory: {}", e))
+    })? {
+        let entry = entry.map_err(|e| {
+            ResizeError::GrowPartition(format!("Failed to read directory entry: {}", e))
+        })?;
+
+        let file_name = entry.path().to_string_lossy().to_string();
+        if !file_name.starts_with(&backup_prefix) || !file_name.ends_with(".bak") {
+            continue;
+        }
+
+        // Extract offset from filename: <backup_path>-0x<offset>.bak
+        let offset_str = file_name
+            .strip_prefix(&format!("{}-", backup_prefix))
+            .and_then(|s| s.strip_suffix(".bak"))
+            .ok_or_else(|| {
+                ResizeError::GrowPartition(format!("Unexpected backup file name: {}", file_name))
+            })?;
+
+        let offset =
+            u64::from_str_radix(offset_str.trim_start_matches("0x"), 16).map_err(|_| {
+                ResizeError::GrowPartition(format!("Invalid offset in backup file: {}", offset_str))
+            })?;
+
+        // Read backup data and write it back to the disk at the original offset
+        let data = std::fs::read(entry.path()).map_err(|e| {
+            ResizeError::GrowPartition(format!("Failed to read backup file {}: {}", file_name, e))
+        })?;
+
+        let mut disk_file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(disk)
+            .map_err(|e| {
+                ResizeError::GrowPartition(format!("Failed to open disk for restore: {}", e))
+            })?;
+
+        disk_file.seek(SeekFrom::Start(offset)).map_err(|e| {
+            ResizeError::GrowPartition(format!("Failed to seek for restore: {}", e))
+        })?;
+
+        disk_file.write_all(&data).map_err(|e| {
+            ResizeError::GrowPartition(format!("Failed to write restore data: {}", e))
+        })?;
+
+        restored += 1;
+    }
+
+    if restored == 0 {
+        return Err(ResizeError::GrowPartition(
+            "No backup files found to restore".to_string(),
+        ));
+    }
+
+    info!("Restored {} backup segment(s)", restored);
+    Ok(())
 }
 
 /// Notifies the kernel of a partition size change using partx.
@@ -548,6 +679,20 @@ fn notify_kernel_partition_change(disk: &str, partition_num: u32) {
             warn!("Failed to execute partx: {}", e);
         }
     }
+}
+
+/// Waits for udev to finish processing device events.
+///
+/// Called after partition table changes to ensure udev rules have been
+/// applied before continuing (same as growpart's unlock_disk_and_settle).
+fn udevadm_settle() {
+    if let Ok(output) = Command::new("udevadm").arg("settle").output()
+        && !output.status.success()
+    {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        warn!("udevadm settle failed: {}", stderr.trim_end());
+    }
+    // If udevadm is not available, silently continue (same as growpart)
 }
 
 pub fn resize_filesystem(
@@ -1271,5 +1416,91 @@ unit: sectors
         };
         // Should not panic — the GPT reservation is skipped
         let _max = compute_max_end(&info);
+    }
+
+    #[test]
+    fn test_restore_single_backup() {
+        let tmpdir = tempfile::tempdir().expect("Failed to create temp dir");
+
+        // Create a fake "disk" file with some content
+        let disk_path = tmpdir.path().join("fake_disk");
+        let mut disk_data = vec![0u8; 1024];
+        disk_data[0..4].copy_from_slice(b"AAAA");
+        std::fs::write(&disk_path, &disk_data).unwrap();
+
+        // Create a backup file: pt-backup-0x00000000.bak
+        let backup_path = tmpdir.path().join("pt-backup");
+        let backup_file = tmpdir.path().join("pt-backup-0x00000000.bak");
+        std::fs::write(&backup_file, b"ORIG").unwrap();
+
+        // Restore
+        let result = restore_partition_table(&disk_path.to_string_lossy(), &backup_path);
+        assert!(result.is_ok());
+
+        // Verify the disk was overwritten at offset 0
+        let restored = std::fs::read(&disk_path).unwrap();
+        assert_eq!(&restored[0..4], b"ORIG");
+    }
+
+    #[test]
+    fn test_restore_multiple_backups() {
+        let tmpdir = tempfile::tempdir().expect("Failed to create temp dir");
+
+        // Create a fake "disk" file
+        let disk_path = tmpdir.path().join("fake_disk");
+        let disk_data = vec![0xFFu8; 2048];
+        std::fs::write(&disk_path, &disk_data).unwrap();
+
+        // Create two backup files at different offsets
+        let backup_path = tmpdir.path().join("pt-backup");
+        let bak1 = tmpdir.path().join("pt-backup-0x00000000.bak");
+        let bak2 = tmpdir.path().join("pt-backup-0x00000200.bak"); // offset 512
+        std::fs::write(&bak1, b"HEAD").unwrap();
+        std::fs::write(&bak2, b"TAIL").unwrap();
+
+        let result = restore_partition_table(&disk_path.to_string_lossy(), &backup_path);
+        assert!(result.is_ok());
+
+        let restored = std::fs::read(&disk_path).unwrap();
+        assert_eq!(&restored[0..4], b"HEAD");
+        assert_eq!(&restored[512..516], b"TAIL");
+        // Data between backups should be untouched
+        assert_eq!(restored[4], 0xFF);
+    }
+
+    #[test]
+    fn test_restore_no_backup_files() {
+        let tmpdir = tempfile::tempdir().expect("Failed to create temp dir");
+        let disk_path = tmpdir.path().join("fake_disk");
+        std::fs::write(&disk_path, b"data").unwrap();
+
+        let backup_path = tmpdir.path().join("pt-backup");
+        // No .bak files exist
+
+        let result = restore_partition_table(&disk_path.to_string_lossy(), &backup_path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_restore_ignores_unrelated_files() {
+        let tmpdir = tempfile::tempdir().expect("Failed to create temp dir");
+        let disk_path = tmpdir.path().join("fake_disk");
+        std::fs::write(&disk_path, vec![0u8; 512]).unwrap();
+
+        let backup_path = tmpdir.path().join("pt-backup");
+
+        // Create an unrelated .bak file (different prefix)
+        let unrelated = tmpdir.path().join("other-backup-0x00000000.bak");
+        std::fs::write(&unrelated, b"NOPE").unwrap();
+
+        // Create a valid backup
+        let valid = tmpdir.path().join("pt-backup-0x00000000.bak");
+        std::fs::write(&valid, b"GOOD").unwrap();
+
+        let result = restore_partition_table(&disk_path.to_string_lossy(), &backup_path);
+        assert!(result.is_ok());
+
+        let restored = std::fs::read(&disk_path).unwrap();
+        assert_eq!(&restored[0..4], b"GOOD");
     }
 }
