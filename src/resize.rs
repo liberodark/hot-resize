@@ -284,6 +284,20 @@ fn parse_disk_geometry(list_output: &str) -> Result<(u64, u64), ResizeError> {
     ))
 }
 
+/// Checks if a sfdisk dump line corresponds to a specific device.
+///
+/// Verifies that the line starts with the device path AND that the next
+/// character is a separator (space, colon, or end of string), preventing
+/// false matches like `/dev/sda1` matching a line for `/dev/sda12`.
+fn line_matches_device(line: &str, device: &str) -> bool {
+    if !line.starts_with(device) {
+        return false;
+    }
+    line.as_bytes()
+        .get(device.len())
+        .is_none_or(|&c| c == b' ' || c == b':')
+}
+
 /// Finds the partition device path in the dump for the given partition number.
 /// Handles both /dev/sda1 and /dev/nvme0n1p1 naming conventions.
 fn find_partition_device(
@@ -300,10 +314,10 @@ fn find_partition_device(
 
     for line in dump.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with(&candidate2) && trimmed.contains("start=") {
+        if line_matches_device(trimmed, &candidate2) && trimmed.contains("start=") {
             return Ok(candidate2);
         }
-        if trimmed.starts_with(&candidate1) && trimmed.contains("start=") {
+        if line_matches_device(trimmed, &candidate1) && trimmed.contains("start=") {
             return Ok(candidate1);
         }
     }
@@ -317,7 +331,7 @@ fn find_partition_device(
 /// Parses start= and size= values for a specific partition from sfdisk dump.
 fn parse_partition_entry(dump: &str, part_device: &str) -> Result<(u64, u64), ResizeError> {
     for line in dump.lines() {
-        if !line.trim().starts_with(part_device) {
+        if !line_matches_device(line.trim(), part_device) {
             continue;
         }
 
@@ -354,7 +368,7 @@ fn collect_other_starts(dump: &str, exclude_device: &str) -> Vec<u64> {
         let trimmed = line.trim();
         if trimmed.starts_with('/')
             && trimmed.contains("start=")
-            && !trimmed.starts_with(exclude_device)
+            && !line_matches_device(trimmed, exclude_device)
             && let Some(start) = extract_sfdisk_field(trimmed, "start=")
             && start > 0
         {
@@ -383,7 +397,8 @@ fn compute_max_end(info: &SfdiskDiskInfo) -> u64 {
     };
 
     // Reserve space for GPT secondary header (same logic as growpart)
-    if max_end > info.sector_num - GPT_SECONDARY_SECTORS {
+    if info.sector_num > GPT_SECONDARY_SECTORS && max_end > info.sector_num - GPT_SECONDARY_SECTORS
+    {
         max_end = info.sector_num - GPT_SECONDARY_SECTORS - 1;
     }
 
@@ -406,7 +421,7 @@ fn build_new_dump(dump: &str, info: &SfdiskDiskInfo, new_size: u64) -> Result<St
     let mut replaced = false;
 
     for line in dump.lines() {
-        if line.trim().starts_with(&info.part_device) && !replaced {
+        if line_matches_device(line.trim(), &info.part_device) && !replaced {
             // Replace the size value, preserving original formatting.
             // sfdisk dump format: "size= <spaces><number>,"
             // We match "size=" followed by optional whitespace and the old size number.
@@ -978,6 +993,57 @@ unit: sectors
     }
 
     #[test]
+    fn test_find_partition_device_ambiguous_numbers() {
+        // /dev/sda1 must NOT match /dev/sda12
+        let dump = "\
+/dev/sda1 : start=        2048, size=    10000000, type=83
+/dev/sda12 : start=    10002048, size=     5000000, type=83
+";
+        let dev = find_partition_device(dump, "/dev/sda", 1).unwrap();
+        assert_eq!(dev, "/dev/sda1");
+
+        let dev = find_partition_device(dump, "/dev/sda", 12).unwrap();
+        assert_eq!(dev, "/dev/sda12");
+    }
+
+    #[test]
+    fn test_find_partition_device_ambiguous_nvme() {
+        let dump = "\
+/dev/nvme0n1p1 : start=        2048, size=    10000000, type=83
+/dev/nvme0n1p12 : start=    10002048, size=     5000000, type=83
+";
+        let dev = find_partition_device(dump, "/dev/nvme0n1", 1).unwrap();
+        assert_eq!(dev, "/dev/nvme0n1p1");
+
+        let dev = find_partition_device(dump, "/dev/nvme0n1", 12).unwrap();
+        assert_eq!(dev, "/dev/nvme0n1p12");
+    }
+
+    #[test]
+    fn test_line_matches_device() {
+        assert!(line_matches_device("/dev/sda1 : start=2048", "/dev/sda1"));
+        assert!(line_matches_device("/dev/sda1: start=2048", "/dev/sda1"));
+        assert!(!line_matches_device("/dev/sda12 : start=2048", "/dev/sda1"));
+        assert!(!line_matches_device("/dev/sda10 : start=2048", "/dev/sda1"));
+        assert!(line_matches_device("/dev/sda12 : start=2048", "/dev/sda12"));
+    }
+
+    #[test]
+    fn test_parse_partition_entry_ambiguous() {
+        let dump = "\
+/dev/sda1 : start=        2048, size=    10000000, type=83
+/dev/sda12 : start=    10002048, size=     5000000, type=83
+";
+        let (start, size) = parse_partition_entry(dump, "/dev/sda1").unwrap();
+        assert_eq!(start, 2048);
+        assert_eq!(size, 10000000);
+
+        let (start, size) = parse_partition_entry(dump, "/dev/sda12").unwrap();
+        assert_eq!(start, 10002048);
+        assert_eq!(size, 5000000);
+    }
+
+    #[test]
     fn test_parse_partition_entry() {
         let (start, size) = parse_partition_entry(SAMPLE_MBR_DUMP, "/dev/sda1").unwrap();
         assert_eq!(start, 2048);
@@ -1009,6 +1075,20 @@ unit: sectors
         let dump = "/dev/sda1 : start=        2048, size=    39999487, type=83\n";
         let starts = collect_other_starts(dump, "/dev/sda1");
         assert!(starts.is_empty());
+    }
+
+    #[test]
+    fn test_collect_other_starts_ambiguous() {
+        // Excluding /dev/sda1 must NOT exclude /dev/sda12
+        let dump = "\
+/dev/sda1 : start=        2048, size=    10000000, type=83
+/dev/sda12 : start=    10002048, size=     5000000, type=83
+";
+        let starts = collect_other_starts(dump, "/dev/sda1");
+        assert_eq!(starts, vec![10002048]);
+
+        let starts = collect_other_starts(dump, "/dev/sda12");
+        assert_eq!(starts, vec![2048]);
     }
 
     #[test]
@@ -1174,5 +1254,22 @@ unit: sectors
         assert_eq!(max, 4863);
         // Verify the resulting size is a multiple of 256 (1 MiB in 4K sectors)
         assert_eq!((max + 1 - info.pt_start) % 256, 0);
+    }
+
+    #[test]
+    fn test_compute_max_end_tiny_disk_no_underflow() {
+        // Disk smaller than GPT_SECONDARY_SECTORS (33) must not panic
+        let info = SfdiskDiskInfo {
+            sector_num: 20,
+            sector_size: 512,
+            pt_start: 1,
+            pt_size: 10,
+            pt_end: 10,
+            other_starts: vec![],
+            part_device: "/dev/sda1".to_string(),
+            is_gpt: false,
+        };
+        // Should not panic — the GPT reservation is skipped
+        let _max = compute_max_end(&info);
     }
 }

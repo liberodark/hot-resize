@@ -257,15 +257,7 @@ fn daemon_loop(
                         }
                     }
                     Err(e) => {
-                        let error_str = e.to_string();
-                        if !error_str.contains("already at maximum size")
-                            && !error_str.contains("no space left")
-                            && !error_str.contains("NOCHANGE")
-                        {
-                            error!("Failed to process device {:?}: {}", device.device, e);
-                        } else {
-                            debug!("Device {:?} already at maximum size", device.device);
-                        }
+                        error!("Failed to process device {:?}: {}", device.device, e);
                     }
                 }
             }
@@ -298,10 +290,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Starting hot-resize v{}", env!("CARGO_PKG_VERSION"));
 
-    // Parse command line arguments
-    let args = Args::parse();
-
-    // Check if running as root unless explicitly skipped
     if !args.no_root_check && !is_root() {
         error!(
             "This program must be run as root. Use sudo or --no-root-check to skip this check (not recommended)"

@@ -6,12 +6,19 @@ pub mod resize;
 
 /// Searches for an executable in the system PATH.
 ///
-/// Returns the full path if found, or None if not found.
+/// Returns the full path if found and executable, or None otherwise.
 pub fn find_in_path(name: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
     std::env::var_os("PATH").and_then(|paths| {
         std::env::split_paths(&paths).find_map(|dir| {
             let full_path = dir.join(name);
-            if full_path.is_file() {
+            if full_path.is_file()
+                && full_path
+                    .metadata()
+                    .map(|m| m.permissions().mode() & 0o111 != 0)
+                    .unwrap_or(false)
+            {
                 Some(full_path)
             } else {
                 None
