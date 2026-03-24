@@ -17,12 +17,13 @@ A tool for hot resizing (without reboot) disk partitions and filesystems.
 ### Required System Dependencies
 
 The following tools must be installed on your system:
-- `lsblk` (typically in util-linux package)
-- `growpart` (typically in cloud-utils or cloud-guest-utils)
+- `sfdisk` and `partx` (typically in util-linux package)
 - `resize2fs` (for ext4, typically in e2fsprogs)
 - `xfs_growfs` (for XFS, typically in xfsprogs)
 - `btrfs` (for Btrfs, typically in btrfs-progs or btrfs-tools)
 - `cryptsetup` (optional, for LUKS support)
+
+Device information (block device size, partition layout, filesystem detection) is read directly from sysfs and superblock magic bytes — no external tools are needed for that.
 
 ### Installing Dependencies by Distribution
 
@@ -36,27 +37,27 @@ environment.systemPackages = with pkgs; [
 #### Debian/Ubuntu
 ```bash
 sudo apt-get update
-sudo apt-get install -y util-linux cloud-guest-utils e2fsprogs xfsprogs btrfs-progs cryptsetup-bin
+sudo apt-get install -y util-linux e2fsprogs xfsprogs btrfs-progs cryptsetup-bin
 ```
 
 #### Fedora/RHEL/CentOS
 ```bash
-sudo dnf install -y util-linux cloud-utils e2fsprogs xfsprogs btrfs-progs cryptsetup
+sudo dnf install -y util-linux e2fsprogs xfsprogs btrfs-progs cryptsetup
 ```
 
 #### Arch Linux
 ```bash
-sudo pacman -S util-linux cloud-utils e2fsprogs xfsprogs btrfs-progs cryptsetup
+sudo pacman -S util-linux e2fsprogs xfsprogs btrfs-progs cryptsetup
 ```
 
 #### openSUSE
 ```bash
-sudo zypper install util-linux cloud-utils e2fsprogs xfsprogs btrfs-progs cryptsetup
+sudo zypper install util-linux e2fsprogs xfsprogs btrfs-progs cryptsetup
 ```
 
 #### Alpine Linux
 ```bash
-sudo apk add util-linux cloud-utils e2fsprogs xfsprogs btrfs-progs cryptsetup
+sudo apk add util-linux e2fsprogs xfsprogs btrfs-progs cryptsetup
 ```
 
 ## Installation

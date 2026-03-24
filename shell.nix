@@ -8,14 +8,10 @@ pkgs.mkShell {
     rustfmt
     clippy
     rust-analyzer
-    pkg-config
-    udev
-    systemd
     util-linux
     e2fsprogs
     xfsprogs
     btrfs-progs
-    cloud-utils
     cryptsetup
   ];
 

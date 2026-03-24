@@ -162,15 +162,30 @@ fn process_device(
     Ok(())
 }
 
+/// Finds the device-mapper name for a LUKS-encrypted device using sysfs.
+///
+/// Reads `/sys/class/block/<dev>/holders/` to find dm-* entries,
+/// then reads `/sys/class/block/<dm>/dm/name` to get the mapper name.
 fn find_luks_mapper(device_path: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let output = Command::new("lsblk")
-        .args(["-lpno", "NAME", &device_path.to_string_lossy()])
-        .output()?;
+    let dev_name = device_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("Invalid device path: {:?}", device_path))?;
 
-    let output_str = String::from_utf8_lossy(&output.stdout);
-    for line in output_str.lines() {
-        if line.contains("mapper") {
-            return Ok(PathBuf::from(line.trim()));
+    let holders_dir = PathBuf::from(format!("/sys/class/block/{}/holders", dev_name));
+    if !holders_dir.exists() {
+        return Err(format!("No sysfs holders directory for {}", dev_name).into());
+    }
+
+    for entry in std::fs::read_dir(&holders_dir)? {
+        let entry = entry?;
+        let holder_name = entry.file_name().to_string_lossy().to_string();
+
+        if holder_name.starts_with("dm-") {
+            let dm_name_path = PathBuf::from(format!("/sys/class/block/{}/dm/name", holder_name));
+            if let Ok(name) = std::fs::read_to_string(&dm_name_path) {
+                return Ok(PathBuf::from(format!("/dev/mapper/{}", name.trim())));
+            }
         }
     }
 

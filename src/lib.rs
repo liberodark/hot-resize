@@ -1,9 +1,24 @@
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tracing::debug;
-use which::which;
 
 pub mod resize;
+
+/// Searches for an executable in the system PATH.
+///
+/// Returns the full path if found, or None if not found.
+pub fn find_in_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths).find_map(|dir| {
+            let full_path = dir.join(name);
+            if full_path.is_file() {
+                Some(full_path)
+            } else {
+                None
+            }
+        })
+    })
+}
 
 #[derive(Debug)]
 pub struct BlockDevice {
@@ -78,7 +93,7 @@ fn resolve_device_name(device_path: &Path) -> Result<String, DeviceError> {
 
 /// Checks if all required tools are available in the system
 pub fn check_requirements(fs_types: &[&str]) -> Result<(), DeviceError> {
-    let mut required_tools = vec!["lsblk", "growpart"];
+    let mut required_tools = vec!["sfdisk"];
 
     // Add filesystem-specific tools based on the provided types
     for fs_type in fs_types {
@@ -108,7 +123,9 @@ pub fn check_requirements(fs_types: &[&str]) -> Result<(), DeviceError> {
     }
 
     for tool in &required_tools {
-        which(*tool).map_err(|_| DeviceError::MissingTool((*tool).to_string()))?;
+        if find_in_path(tool).is_none() {
+            return Err(DeviceError::MissingTool((*tool).to_string()));
+        }
     }
 
     Ok(())
@@ -395,14 +412,32 @@ mod tests {
     }
 
     #[test]
+    fn test_find_in_path_existing_tool() {
+        // "sh" should exist on any Unix system
+        assert!(find_in_path("sh").is_some());
+    }
+
+    #[test]
+    fn test_find_in_path_nonexistent_tool() {
+        assert!(find_in_path("nonexistent_tool_xyz_12345").is_none());
+    }
+
+    #[test]
+    fn test_find_in_path_returns_full_path() {
+        if let Some(path) = find_in_path("sh") {
+            assert!(path.is_absolute() || path.starts_with("/"));
+            assert!(path.is_file());
+        }
+    }
+
+    #[test]
     fn test_check_requirements() {
         let fs_types = vec!["ext4", "xfs", "btrfs"];
         match check_requirements(&fs_types) {
             Ok(_) => println!("All tools are available"),
             Err(DeviceError::MissingTool(tool)) => {
                 assert!(
-                    ["lsblk", "growpart", "resize2fs", "xfs_growfs", "btrfs"]
-                        .contains(&tool.as_str()),
+                    ["sfdisk", "resize2fs", "xfs_growfs", "btrfs"].contains(&tool.as_str()),
                     "Unexpected missing tool: {}",
                     tool
                 );
