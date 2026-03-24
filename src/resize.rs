@@ -114,14 +114,18 @@ const GROW_FUDGE_BYTES: u64 = 1024 * 1024; // 1 MiB, same as growpart
 /// Sectors reserved for GPT secondary header and table.
 const GPT_SECONDARY_SECTORS: u64 = 33;
 
+/// Maximum number of 512-byte sectors addressable by MBR partition tables (2^32).
+/// MBR uses 32-bit LBA fields, limiting partitions to ~2 TiB on 512-byte sector disks.
+const MBR_MAX_SECTORS_512: u64 = 4_294_967_296;
+
 /// Alignment boundary in bytes. Partition sizes are rounded down to multiples
 /// of this value for optimal I/O alignment (matches growpart behavior).
 const ALIGN_BYTES: u64 = 1024 * 1024; // 1 MiB
 
-pub fn grow_partition(disk: &str, partition: Option<u32>) -> Result<(), ResizeError> {
+pub fn grow_partition(disk: &str, partition: Option<u32>) -> Result<bool, ResizeError> {
     if partition.is_none() {
         info!("Device is a whole disk (not a partition), skipping partition resize");
-        return Ok(());
+        return Ok(false);
     }
 
     let partition_num = partition.unwrap();
@@ -142,7 +146,7 @@ pub fn grow_partition(disk: &str, partition: Option<u32>) -> Result<(), ResizeEr
             "Partition {} is already at maximum size (end={}, max={})",
             partition_num, disk_info.pt_end, max_end
         );
-        return Ok(());
+        return Ok(false);
     }
 
     let growth_sectors = max_end - disk_info.pt_end;
@@ -152,7 +156,7 @@ pub fn grow_partition(disk: &str, partition: Option<u32>) -> Result<(), ResizeEr
             "Partition {} could only grow by {} bytes (< {} fudge), skipping",
             partition_num, growth_bytes, GROW_FUDGE_BYTES
         );
-        return Ok(());
+        return Ok(false);
     }
 
     let new_size = max_end - disk_info.pt_start + 1;
@@ -181,7 +185,7 @@ pub fn grow_partition(disk: &str, partition: Option<u32>) -> Result<(), ResizeEr
         // Release flock and settle even on failure (same as growpart cleanup)
         drop(disk_lock);
         udevadm_settle();
-        return apply_result;
+        return apply_result.map(|_| false);
     }
 
     // Step 8: Notify kernel (while still holding the flock)
@@ -192,7 +196,73 @@ pub fn grow_partition(disk: &str, partition: Option<u32>) -> Result<(), ResizeEr
     udevadm_settle();
 
     info!("Successfully grew partition {} on {}", partition_num, disk);
-    Ok(())
+    Ok(true)
+}
+
+/// Attempts to resize an LVM physical volume if the partition is one.
+///
+/// After a partition is grown, the LVM PV on it needs to be resized to
+/// use the new space. This is equivalent to growpart's `maybe_lvm_resize`.
+/// If `lvm` is not installed or the partition is not an LVM PV, this is a no-op.
+pub fn maybe_lvm_resize(partition_device: &Path) -> Result<(), ResizeError> {
+    // Check if lvm command is available
+    if crate::find_in_path("lvm").is_none() {
+        return Ok(());
+    }
+
+    // Check if the partition is an LVM physical volume
+    let pvs_output = Command::new("lvm")
+        .args([
+            "pvs",
+            "--nolocking",
+            "--readonly",
+            "-o",
+            "pvname",
+            &partition_device.to_string_lossy(),
+        ])
+        .output();
+
+    match pvs_output {
+        Ok(output) => {
+            if output.status.code() == Some(5) {
+                // Exit code 5 means "not an LVM PV"
+                return Ok(());
+            }
+            if !output.status.success() {
+                return Ok(());
+            }
+        }
+        Err(_) => return Ok(()),
+    }
+
+    // Partition is an LVM PV — resize it
+    info!(
+        "Detected LVM physical volume on {}, running pvresize",
+        partition_device.display()
+    );
+
+    let pvresize_output = Command::new("lvm")
+        .args(["pvresize", &partition_device.to_string_lossy()])
+        .output();
+
+    match pvresize_output {
+        Ok(output) => {
+            if output.status.success() {
+                info!("Successfully resized LVM physical volume");
+                Ok(())
+            } else {
+                let error = String::from_utf8_lossy(&output.stderr);
+                Err(ResizeError::ResizeFs(format!(
+                    "Failed to resize LVM PV: {}",
+                    error.trim_end()
+                )))
+            }
+        }
+        Err(e) => Err(ResizeError::CommandFailed(format!(
+            "Failed to execute lvm pvresize: {}",
+            e
+        ))),
+    }
 }
 
 /// Information about a partition parsed from sfdisk --dump output.
@@ -401,6 +471,7 @@ fn collect_other_starts(dump: &str, exclude_device: &str) -> Vec<u64> {
 
 /// Computes the maximum end sector for the partition, considering:
 /// - Other partitions that start after this one
+/// - MBR 2 TiB limit on dos-labeled disks
 /// - GPT secondary header (33 sectors from end of disk)
 /// - 1 MiB alignment (partition size rounded down to multiple of 1 MiB)
 fn compute_max_end(info: &SfdiskDiskInfo) -> u64 {
@@ -416,6 +487,17 @@ fn compute_max_end(info: &SfdiskDiskInfo) -> u64 {
         Some(next_start) => next_start - 1,
         None => info.sector_num - 1,
     };
+
+    // MBR/dos: cap at the 2 TiB boundary (same logic as growpart).
+    // MBR partition entries use 32-bit LBA fields.
+    // For sector sizes other than 512, adjust proportionally.
+    if !info.is_gpt {
+        let mbr_max_sectors = MBR_MAX_SECTORS_512 * (info.sector_size / 512);
+        if max_end > mbr_max_sectors {
+            warn!("MBR/dos partitioned disk is larger than 2 TiB, additional space will go unused");
+            max_end = mbr_max_sectors;
+        }
+    }
 
     // Reserve space for GPT secondary header (same logic as growpart)
     if info.sector_num > GPT_SECONDARY_SECTORS && max_end > info.sector_num - GPT_SECONDARY_SECTORS
@@ -1416,6 +1498,48 @@ unit: sectors
         };
         // Should not panic — the GPT reservation is skipped
         let _max = compute_max_end(&info);
+    }
+
+    #[test]
+    fn test_mbr_max_sectors_constant() {
+        assert_eq!(MBR_MAX_SECTORS_512, 4_294_967_296); // 2^32
+    }
+
+    #[test]
+    fn test_compute_max_end_mbr_2tb_limit() {
+        // Simulate a 3 TiB MBR disk (way over 2 TiB limit)
+        // 3 TiB = 6_442_450_944 sectors of 512 bytes
+        let info = SfdiskDiskInfo {
+            sector_num: 6_442_450_944,
+            sector_size: 512,
+            pt_start: 2048,
+            pt_size: 1_000_000,
+            pt_end: 2048 + 1_000_000 - 1,
+            other_starts: vec![],
+            part_device: "/dev/sda1".to_string(),
+            is_gpt: false, // MBR
+        };
+        let max = compute_max_end(&info);
+        // max_end must be capped at MBR_MAX_SECTORS_512 then aligned
+        assert!(max <= MBR_MAX_SECTORS_512);
+    }
+
+    #[test]
+    fn test_compute_max_end_gpt_no_mbr_limit() {
+        // Same 3 TiB disk but GPT — no 2 TiB cap
+        let info = SfdiskDiskInfo {
+            sector_num: 6_442_450_944,
+            sector_size: 512,
+            pt_start: 2048,
+            pt_size: 1_000_000,
+            pt_end: 2048 + 1_000_000 - 1,
+            other_starts: vec![],
+            part_device: "/dev/sda1".to_string(),
+            is_gpt: true, // GPT — no MBR limit
+        };
+        let max = compute_max_end(&info);
+        // GPT: should be much larger than MBR limit
+        assert!(max > MBR_MAX_SECTORS_512);
     }
 
     #[test]

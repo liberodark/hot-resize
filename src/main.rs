@@ -132,10 +132,13 @@ fn process_device(
 
     // Grow partition
     if block_device.partition_number.is_some() {
-        resize::grow_partition(
+        let changed = resize::grow_partition(
             &format!("/dev/{}", block_device.disk_name),
             block_device.partition_number,
         )?;
+        if changed {
+            resize::maybe_lvm_resize(&block_device.real_device)?;
+        }
     } else {
         info!("Skipping partition resize for whole disk device");
     }
