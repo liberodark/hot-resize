@@ -283,6 +283,7 @@ struct SfdiskDiskInfo {
 /// Runs `sfdisk --dump <disk>` and returns its output.
 fn sfdisk_dump(disk: &str) -> Result<String, ResizeError> {
     let output = Command::new("sfdisk")
+        .env("LANG", "C")
         .args(["--dump", disk])
         .output()
         .map_err(|e| {
@@ -309,6 +310,7 @@ fn parse_sfdisk_dump(
 ) -> Result<SfdiskDiskInfo, ResizeError> {
     // Get disk geometry from sfdisk --list (first line gives total sectors)
     let list_output = Command::new("sfdisk")
+        .env("LANG", "C")
         .args(["--list", "--unit=S", disk])
         .output()
         .map_err(|e| {
@@ -592,6 +594,7 @@ fn apply_sfdisk(disk: &str, new_dump: &str, original_dump: &str) -> Result<(), R
 
     // Run sfdisk with -O to save a binary backup before writing
     let mut child = Command::new("sfdisk")
+        .env("LANG", "C")
         .args([
             "--no-reread",
             "--force",
