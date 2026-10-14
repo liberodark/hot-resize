@@ -367,7 +367,7 @@ fn parse_disk_geometry(list_output: &str) -> Result<(u64, u64), ResizeError> {
                 }
             }
             if let (Some(bytes), Some(secs)) = (disk_bytes, sectors) {
-                let sector_size = if secs > 0 { bytes / secs } else { 512 };
+                let sector_size = bytes.checked_div(secs).unwrap_or(512);
                 return Ok((secs, sector_size));
             }
         }
@@ -510,10 +510,9 @@ fn compute_max_end(info: &SfdiskDiskInfo) -> u64 {
     // Align partition size to 1 MiB boundary (same logic as growpart).
     // This rounds the partition size DOWN to the nearest 1 MiB multiple.
     let sectors_per_align = ALIGN_BYTES / info.sector_size;
-    if sectors_per_align > 0 {
-        let max_size = max_end + 1 - info.pt_start;
-        let aligned_size = (max_size / sectors_per_align) * sectors_per_align;
-        max_end = aligned_size + info.pt_start - 1;
+    let max_size = max_end + 1 - info.pt_start;
+    if let Some(aligned_units) = max_size.checked_div(sectors_per_align) {
+        max_end = aligned_units * sectors_per_align + info.pt_start - 1;
     }
 
     max_end

@@ -1,6 +1,6 @@
 [package]
 name = "hot-resize"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 description = "Safe disk resizing tool"
 license = "GPL-3.0"
